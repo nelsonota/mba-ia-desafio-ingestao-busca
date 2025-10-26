@@ -1,5 +1,12 @@
-PROMPT_TEMPLATE = """
-CONTEXTO:
+from typing import Callable, List, Optional, Tuple
+
+from langchain_core.prompts import PromptTemplate
+from langchain_postgres import PGVector
+from langchain.schema import Document
+
+from config import build_embeddings, build_llm, load_settings
+
+PROMPT_TEMPLATE = """CONTEXTO:
 {contexto}
 
 REGRAS:
@@ -25,5 +32,60 @@ PERGUNTA DO USUÁRIO:
 RESPONDA A "PERGUNTA DO USUÁRIO"
 """
 
-def search_prompt(question=None):
-    pass
+OUT_OF_CONTEXT_MSG = "Não tenho informações necessárias para responder sua pergunta."
+
+
+def _format_context(
+    results: List[Tuple[Document, float]],
+) -> Optional[str]:
+    if not results:
+        return None
+    chunks = [doc.page_content.strip() for doc, _ in results if doc.page_content.strip()]
+    if not chunks:
+        return None
+    return "\n\n---\n\n".join(chunks)
+
+
+def _build_runner() -> Callable[[str], str]:
+    settings = load_settings()
+    embedding = build_embeddings(settings)
+    vector_store = PGVector(
+        embeddings=embedding,
+        connection=settings.database_url,
+        collection_name=settings.collection_name,
+    )
+    llm = build_llm(settings)
+    prompt = PromptTemplate(
+        input_variables=["contexto", "pergunta"],
+        template=PROMPT_TEMPLATE,
+    )
+
+    def runner(question: str) -> str:
+        user_question = (question or "").strip()
+        if not user_question:
+            return "Digite uma pergunta válida."
+
+        results = vector_store.similarity_search_with_score(
+            user_question,
+            k=settings.top_k,
+        )
+        contexto = _format_context(results)
+        if not contexto:
+            return OUT_OF_CONTEXT_MSG
+
+        formatted = prompt.format(contexto=contexto, pergunta=user_question)
+        response = llm.invoke(formatted)
+        return getattr(response, "content", response) or OUT_OF_CONTEXT_MSG
+
+    return runner
+
+
+def search_prompt(question: Optional[str] = None):
+    """
+    Retorna um callable que executa a busca RAG ou, opcionalmente, responde
+    imediatamente à pergunta fornecida.
+    """
+    runner = _build_runner()
+    if question is not None:
+        return runner(question)
+    return runner
